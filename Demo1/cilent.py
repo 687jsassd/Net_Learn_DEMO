@@ -81,19 +81,19 @@ class Trail:
         """
         if len(self.points) < 2:
             return
-        
+
         points_list = list(self.points)
         total = len(points_list)
-        
+
         for i in range(total - 1):
             # 计算当前段在轨迹中的位置比例 (0-1)
             ratio = i / (total - 1) if total > 1 else 0
-            
+
             # 彩虹渐变：根据比例计算色相 (0-360)
             hue = ratio * 360
             hue_prime = hue / 60
             x = int(255 * (1 - abs(hue_prime % 2 - 1)))
-            
+
             # HSV 转 RGB
             if hue_prime < 1:
                 r, g, b = 255, x, 0
@@ -107,9 +107,10 @@ class Trail:
                 r, g, b = x, 0, 255
             else:
                 r, g, b = 255, 0, x
-            
+
             # 绘制线段
-            pygame.draw.line(screen, (r, g, b), points_list[i], points_list[i+1], 3)
+            pygame.draw.line(screen, (r, g, b),
+                             points_list[i], points_list[i+1], 3)
 
 
 # 所有玩家地址
@@ -189,15 +190,15 @@ while True:
                      HEIGHT - ball.r - ball.cur_speed)
 
     screen.fill((0, 0, 0))
-    
+
     # 坐标文本和模式提示的字体
     font = pygame.font.Font(None, 36)
-    
+
     # 显示模式提示
     mode_text = "Single-Player Mode" if not connected else "Multiplayer Mode"
     mode_surface = font.render(mode_text, True, (100, 100, 100))
     screen.blit(mode_surface, (WIDTH - 200, 10))
-    
+
     # 多人模式：显示其他玩家
     if connected:
         for idx, (addr, pos) in enumerate(all_players.items()):
@@ -224,4 +225,4 @@ while True:
     screen.blit(text, (10, 10))
 
     pygame.display.flip()
-    clock.tick(120)
+    clock.tick(60)
