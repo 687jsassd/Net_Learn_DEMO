@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"net/http"
+	_ "net/http/pprof" // 下划线表示仅导入初始化，无需调用
 	"sync"
 	"time"
 )
@@ -48,6 +50,10 @@ func (b *BallObj) SetXY(x, y uint16) { //虽然单个是原子操作，但是俩
 }
 
 func main() {
+	go func() {
+		fmt.Println("pprof性能分析服务启动：http://127.0.0.1:6060/debug/pprof/")
+		_ = http.ListenAndServe(":6060", nil)
+	}()
 	listener, err := net.Listen("tcp", Port)
 	if err != nil {
 		fmt.Println("Server start error:", err)
