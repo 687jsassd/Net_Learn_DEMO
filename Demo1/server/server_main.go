@@ -1,32 +1,49 @@
 package main
 
 import (
-	"encoding/json"
+	"bytes"
+	"encoding/binary"
 	"fmt"
+	"math"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	Port = ":16543"
+	Port                    = ":16543"
+	CollectInterval         = 16 * time.Millisecond //近似64tick
+	Single_BallPostion_Size = 20                    //8字节X，8字节Y，4字节ID
 )
 
 var (
-	cilents    = make(map[net.Conn]*BallObj)
-	cilents_Mu sync.RWMutex
+	cur_max_ball_id atomic.Uint32           //当前最大球ID，暂时用这个
+	broadcast_chan  = make(chan []byte, 10) //collect_positions的数据，通过该chan移交给spread_positions协程
+
+	cilents          = make(map[net.Conn]*BallObj)
+	cilents_Mu       sync.RWMutex
+	writing_chans    = make(map[net.Conn]chan []byte) //为每个链接开一个chan，以写入数据
+	writing_chans_Mu sync.RWMutex
 )
 
-// 对象池
-var ballPool = sync.Pool{
-	New: func() interface{} {
-		return &BallObj{}
-	},
+type BallObj struct {
+	X  atomic.Uint64 `json:"x"`
+	Y  atomic.Uint64 `json:"y"`
+	ID uint32        //分配一个球ID，方便识别，而且避免传输时直接传送IP地址
+	mu sync.Mutex
 }
 
-type BallObj struct {
-	X float64 `json:"X"`
-	Y float64 `json:"Y"`
+func (b *BallObj) GetXY() (float64, float64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return math.Float64frombits(b.X.Load()), math.Float64frombits(b.Y.Load())
+}
+func (b *BallObj) SetXY(x, y float64) { //虽然单个是原子操作，但是俩就不是了，得加锁！
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.X.Store(math.Float64bits(x))
+	b.Y.Store(math.Float64bits(y))
 }
 
 func main() {
@@ -39,7 +56,8 @@ func main() {
 
 	fmt.Println("Listening port", Port)
 
-	go broadcast_position()
+	go collect_positions() //收集需要广播的数据
+	go spread_positions()  //分发数据到各个连接的写channel
 
 	//接收处理链接
 
@@ -51,57 +69,79 @@ func main() {
 			continue
 		}
 		fmt.Println("Accept connection success:", conn.RemoteAddr())
-
-		//加链接到map
-		cilents_Mu.Lock()
-		cilents[conn] = ballPool.Get().(*BallObj) //放回在handle_position中
-		cilents_Mu.Unlock()
-
-		go handle_position(conn)
-
+		go handle_connection(conn)
 	}
 
 }
 
-func broadcast_position() {
+func collect_positions() {
+	buf := new(bytes.Buffer)
 	for {
-		time.Sleep(40 * time.Millisecond)
+		time.Sleep(CollectInterval)
+		buf.Reset()
+
 		cilents_Mu.RLock()
-		if len(cilents) == 0 {
+		clients_nums := len(cilents) //收集一下数量，后面分配切片大小直接分配
+		if clients_nums == 0 {
 			cilents_Mu.RUnlock()
 			continue
 		}
-		type clientInfo struct {
-			conn net.Conn
-			addr string
-			X    int
-			Y    int
+		//快速收集拷贝一遍所有客户端的数据
+		var positions []struct {
+			X, Y float64
+			ID   uint32
 		}
-		var clientsToBroadcast []clientInfo
-		for conn, ball := range cilents {
-			clientsToBroadcast = append(clientsToBroadcast, clientInfo{
-				conn: conn,
-				addr: conn.RemoteAddr().String(),
-				X:    int(ball.X),
-				Y:    int(ball.Y),
-			})
+		for _, ball := range cilents {
+			if ball.ID == 0 {
+				continue
+			}
+			x, y := ball.GetXY()
+			positions = append(positions, struct {
+				X, Y float64
+				ID   uint32
+			}{x, y, ball.ID})
 		}
-		cilents_Mu.RUnlock() // 尽早释放锁
+		cilents_Mu.RUnlock()
 
-		positions := make(map[string]struct{ X, Y int })
-		for _, c := range clientsToBroadcast {
-			positions[c.addr] = struct{ X, Y int }{c.X, c.Y}
-		}
-		jsonStr, err := json.Marshal(positions)
-		if err != nil {
-			continue
-		}
-		jsonStr = append(jsonStr, '\n')
+		//写消息类型1,表示坐标同步
+		msgType := uint32(1) //4字节
+		_ = binary.Write(buf, binary.LittleEndian, msgType)
 
-		for _, c := range clientsToBroadcast {
-			if _, err := c.conn.Write(jsonStr); err != nil {
-				// 处理错误，例如标记连接为关闭
+		//写消息长度
+		msgLen := uint32(len(positions) * Single_BallPostion_Size) //4字节
+		_ = binary.Write(buf, binary.LittleEndian, msgLen)
+
+		//遍历positions，按小端序写
+		for _, pos := range positions {
+			_ = binary.Write(buf, binary.LittleEndian, pos.ID)
+			_ = binary.Write(buf, binary.LittleEndian, pos.X)
+			_ = binary.Write(buf, binary.LittleEndian, pos.Y)
+		}
+		binData := buf.Bytes()
+
+		select {
+		case broadcast_chan <- binData:
+		default:
+			select {
+			case <-broadcast_chan:
+			default:
+			}
+			broadcast_chan <- binData
+		}
+
+	}
+}
+
+func spread_positions() {
+	for binData := range broadcast_chan {
+		writing_chans_Mu.Lock()
+		for conn, ch := range writing_chans {
+			select {
+			case ch <- binData:
+			default:
+				fmt.Println("Write to client_w_chan failed:", conn.RemoteAddr())
 			}
 		}
+		writing_chans_Mu.Unlock()
 	}
 }

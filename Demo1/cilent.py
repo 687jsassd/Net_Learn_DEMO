@@ -6,9 +6,19 @@ import socket
 import json
 import threading
 from collections import deque
+import struct
 
 pygame.init()
+
 WIDTH, HEIGHT = 1280, 800
+
+HEADER_SIZE = 8  # 4字节类型+4字节长度
+
+
+MSG_TYPE_POS = 1  # 位置同步消息
+PLAYER_SIZE = 20  # 每个玩家20字节
+
+
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
 pygame.display.set_caption("Demo1-Cilent")
 
@@ -113,9 +123,8 @@ class Trail:
                              points_list[i], points_list[i+1], 3)
 
 
-# 所有玩家地址
+# 所有玩家(ID:(X,Y))
 all_players = {}
-self_addr = ""
 # 时钟
 clock = pygame.time.Clock()
 # 自己小球
@@ -129,7 +138,6 @@ connected = False
 try:
     cilent_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     cilent_socket.connect(("127.0.0.1", 16543))
-    self_addr = cilent_socket.getsockname()
     connected = True
     print("Connected to server. Multiplayer mode enabled.")
 except Exception as e:
@@ -139,23 +147,73 @@ except Exception as e:
 
 
 def receive_server_data():
-    global all_players
+    recv_buffer = bytearray()
     while True:
         if not connected:
             break
         try:
-            data = cilent_socket.recv(4096).decode("utf-8")
-            if data == "":
+            data = cilent_socket.recv(4096)
+            if not data:
                 continue
+            recv_buffer.extend(data)
             # print(data)
+            # 这里要解析二进制数据了，发送时格式：
+            # 遍历positions，按小端序写
+            # for _, pos := range positions {
+            #     _ = binary.Write(buf, binary.LittleEndian, pos.ID)
+            #     _ = binary.Write(buf, binary.LittleEndian, pos.X)
+            #     _ = binary.Write(buf, binary.LittleEndian, pos.Y)
+            # }
+            # binData := buf.Bytes()
+            #
+            # 每个玩家数据固定20字节，前4字节为ID，后16字节为X,Y坐标
+            #
 
-            lines = data.strip().split("\n")
-            for line in lines:
-                if line:
-                    all_players = json.loads(line)
+            # 读8字节包头
+            while len(recv_buffer) >= HEADER_SIZE:
+                # 取8字节
+                header = recv_buffer[:HEADER_SIZE]
+                msg_type, body_len = struct.unpack("<II", header)
+
+                # 总数据长度
+                full_packet_len = HEADER_SIZE + body_len
+
+                # 等待缓存区包
+                while len(recv_buffer) < full_packet_len:
+                    break
+
+                # 取包
+                full_packet = recv_buffer[:full_packet_len]
+                del recv_buffer[:full_packet_len]
+
+                # 提取消息体
+                body_data = full_packet[HEADER_SIZE:]
+
+                # 分配给处理函数
+                handle_server_message(msg_type, body_data)
+
         except Exception as e:
             print("Receive server error:", e)
             break
+
+
+def handle_server_message(msg_type, body_data):
+    global all_players
+    if msg_type == MSG_TYPE_POS:
+        # 清空旧帧数据
+        all_players.clear()
+
+        for i in range(0, len(body_data), PLAYER_SIZE):
+            # 截取单个玩家的20字节
+            player_bytes = body_data[i:i+PLAYER_SIZE]
+
+            # 安全判断：不足20字节直接跳过
+            if len(player_bytes) != PLAYER_SIZE:
+                continue
+
+            # 解析单个玩家
+            player_id, x, y = struct.unpack("<Idd", player_bytes)
+            all_players[player_id] = {"X": x, "Y": y}
 
 
 if connected:
@@ -197,17 +255,13 @@ while True:
     # 显示模式提示
     mode_text = "Single-Player Mode" if not connected else "Multiplayer Mode"
     mode_surface = font.render(mode_text, True, (100, 100, 100))
-    screen.blit(mode_surface, (WIDTH - 200, 10))
+    screen.blit(mode_surface, (WIDTH - 600, 10))
 
     # 多人模式：显示其他玩家
     if connected:
-        for idx, (addr, pos) in enumerate(all_players.items()):
-            if addr == self_addr[0]+":"+str(self_addr[1]):
-                pygame.draw.circle(screen, (0, 255, 0),  # 绿色小球背景
-                                   (pos["X"], pos["Y"]), 20)
-            else:
-                pygame.draw.circle(screen, (0, 0, 255),
-                                   (pos["X"], pos["Y"]), 20)
+        for idx, (pl_id, pos) in enumerate(all_players.items()):
+            pygame.draw.circle(screen, (0, 255, 0),
+                               (pos["X"], pos["Y"]), 20)
 
     pygame.draw.circle(screen, ball.color, (ball.x, ball.y), ball.r)  # 自己在最上层
     # 轨迹（颜色渐变效果）
@@ -225,4 +279,4 @@ while True:
     screen.blit(text, (10, 10))
 
     pygame.display.flip()
-    clock.tick(60)
+    clock.tick(64)

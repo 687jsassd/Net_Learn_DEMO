@@ -4,20 +4,20 @@ import threading
 import random
 import time
 
-# 压力测试配置
+# 配置
 SERVER_IP = "127.0.0.1"
 SERVER_PORT = 16543
-SIMULATE_COUNT = 50
+SIMULATE_COUNT = 500
 WIDTH, HEIGHT = 1280, 800
 
-# 单个模拟客户端
 
-
-def simulate_ball():
+def simulate_ball(client_id):
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5)
         sock.connect((SERVER_IP, SERVER_PORT))
-        # 随机初始位置
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
         x = random.randint(50, WIDTH-50)
         y = random.randint(50, HEIGHT-50)
         speed = random.randint(2, 11)
@@ -26,30 +26,34 @@ def simulate_ball():
             # 随机移动
             x += random.choice([-speed, 0, speed])
             y += random.choice([-speed, 0, speed])
-            # 边界限制
             x = max(20, min(x, WIDTH-20))
             y = max(20, min(y, HEIGHT-20))
-            # 发送坐标
-            msg = json.dumps({"X": x, "Y": y}) + "\n"
-            sock.send(msg.encode())
-            time.sleep(0.03)  # 30ms同步一次
 
-            # 接收服务器响应，不处理，防止因接收问题导致的服务端阻塞
-            data = sock.recv(4096).decode("utf-8")
+            msg = json.dumps({"x": x, "y": y}) + "\n"
+            sock.sendall(msg.encode())
+            time.sleep(1/64)  # 模拟64tick
 
-    except:
-        pass
+            # ✅ 极简清空二进制接收缓冲区（适配新包头协议）
+            try:
+                sock.setblocking(False)
+                while sock.recv(4096):
+                    pass
+                sock.setblocking(True)
+            except BlockingIOError:
+                pass
+
+    except Exception as e:
+        print(f"客户端{client_id}异常: {e}")
+    finally:
+        sock.close()
 
 
-# 批量启动模拟客户端
 if __name__ == "__main__":
-    print(f"启动 {SIMULATE_COUNT} 个模拟小球...")
+    print(f"启动 {SIMULATE_COUNT} 个压测客户端...")
     for i in range(SIMULATE_COUNT):
-        t = threading.Thread(target=simulate_ball, daemon=True)
-        t.start()
-        # 防止连接风暴，轻微延迟
-        if i % 100 == 0:
-            time.sleep(0.1)
-    # 保持程序运行
+        threading.Thread(target=simulate_ball, args=(i,), daemon=True).start()
+        time.sleep(1/64)
+
+    print("压测运行中...")
     while True:
         time.sleep(1)
