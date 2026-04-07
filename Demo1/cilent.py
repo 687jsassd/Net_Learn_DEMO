@@ -12,11 +12,11 @@ pygame.init()
 
 WIDTH, HEIGHT = 1280, 800
 
-HEADER_SIZE = 8  # 4字节类型+4字节长度
+HEADER_SIZE = 3  # 1字节类型+2字节长度
 
 
 MSG_TYPE_POS = 1  # 位置同步消息
-PLAYER_SIZE = 20  # 每个玩家20字节
+PLAYER_SIZE = 6  # 每个玩家6字节
 
 
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -166,14 +166,14 @@ def receive_server_data():
             # }
             # binData := buf.Bytes()
             #
-            # 每个玩家数据固定20字节，前4字节为ID，后16字节为X,Y坐标
+            #
             #
 
-            # 读8字节包头
+            # 读包头
             while len(recv_buffer) >= HEADER_SIZE:
-                # 取8字节
+                # 取包头字节(1+2)
                 header = recv_buffer[:HEADER_SIZE]
-                msg_type, body_len = struct.unpack("<II", header)
+                msg_type, body_len = struct.unpack("<BH", header)
 
                 # 总数据长度
                 full_packet_len = HEADER_SIZE + body_len
@@ -204,16 +204,16 @@ def handle_server_message(msg_type, body_data):
         all_players.clear()
 
         for i in range(0, len(body_data), PLAYER_SIZE):
-            # 截取单个玩家的20字节
+            # 截取单个玩家的字节
             player_bytes = body_data[i:i+PLAYER_SIZE]
 
-            # 安全判断：不足20字节直接跳过
+            # 安全判断：不足字节直接跳过
             if len(player_bytes) != PLAYER_SIZE:
                 continue
 
             # 解析单个玩家
-            player_id, x, y = struct.unpack("<Idd", player_bytes)
-            all_players[player_id] = {"X": x, "Y": y}
+            player_id, x, y = struct.unpack("<HHH", player_bytes)
+            all_players[player_id] = {"X": float(x)/10, "Y": float(y)/10}
 
 
 if connected:
@@ -273,8 +273,10 @@ while True:
 
     # 发送位置（仅在连接时）
     if connected:
-        cilent_socket.send(
-            (json.dumps({"X": ball.x, "Y": ball.y})+"\n").encode("utf-8"))
+        x_int = round(ball.x * 10)
+        y_int = round(ball.y * 10)
+        bin_data = struct.pack("<HH", x_int, y_int)
+        cilent_socket.send(bin_data)
 
     screen.blit(text, (10, 10))
 

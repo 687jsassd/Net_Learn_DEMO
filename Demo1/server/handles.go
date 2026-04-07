@@ -1,11 +1,10 @@
 package main
 
 import (
-	"bufio"
-	"encoding/json"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
-	"strings"
 	"sync"
 )
 
@@ -30,7 +29,10 @@ func handle_connection(conn net.Conn) {
 	}()
 
 	//获取ID
-	newID := cur_max_ball_id.Add(1)
+	cur_max_ball_id_Mu.Lock()
+	cur_max_ball_id++ //先加，因为ID=0被认定为无效
+	newID := cur_max_ball_id
+	cur_max_ball_id_Mu.Unlock()
 
 	//加Ball相关映射到map
 	cilents_Mu.Lock()
@@ -58,29 +60,17 @@ func handle_connection(conn net.Conn) {
 }
 
 func handle_position(conn net.Conn) {
-	reader := bufio.NewReader(conn)
+	buf := make([]byte, 4) // 固定读4字节（2+2 uint16）
 	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
+		n, err := io.ReadFull(conn, buf)
+		if err != nil || n != 4 {
 			return
 		}
-		//fmt.Println("Received line:", line)
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		//解析json,从中获取X和Y字段，然后使用带锁的SetXY方法更新
-		var pos struct {
-			X float64 `json:"X"`
-			Y float64 `json:"Y"`
-		}
-		if err := json.Unmarshal([]byte(line), &pos); err != nil {
-			fmt.Printf("JSON解析失败: %v, 数据: %s\n", err, line)
-			continue
-		}
+		x := binary.LittleEndian.Uint16(buf[0:2])
+		y := binary.LittleEndian.Uint16(buf[2:4])
 
 		cilents_Mu.RLock()
-		cilents[conn].SetXY(pos.X, pos.Y)
+		cilents[conn].SetXY(x, y)
 		cilents_Mu.RUnlock()
 	}
 }
