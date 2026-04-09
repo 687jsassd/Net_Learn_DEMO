@@ -4,6 +4,7 @@ import pygame
 import sys
 import socket
 import json
+import time
 import threading
 from collections import deque
 import struct
@@ -14,9 +15,19 @@ WIDTH, HEIGHT = 1280, 800
 
 HEADER_SIZE = 3  # 1字节类型+2字节长度
 
+# 向服务端发送的消息的相关常量
+MSG_TYPE_ENTER = 1  # 加入游戏消息
+MSG_SIZE_ENTER = 0  # 加入游戏消息体长度为0
 
-MSG_TYPE_POS = 1  # 位置同步消息
+MSG_TYPE_POS = 3  # 小球位置同步消息
+MSG_SIZE_POS = 4  # 小球位置同步消息体长度为4字节，2字节X轴坐标+2字节Y轴坐标
+
+
+# 接受的服务端消息相关常量
+SERVER_MSG_TYPE_POS = 1  # 位置同步消息
 PLAYER_SIZE = 6  # 每个玩家6字节
+
+SERVER_MSG_TYPE_ENTER = 2  # 加入游戏消息
 
 
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -129,7 +140,7 @@ all_players = {}
 clock = pygame.time.Clock()
 # 自己小球
 ball = Ball(WIDTH // 2, HEIGHT // 2, 20, (255, 0, 0), 5)
-
+self_player_id = None
 
 # 网络连接相关变量
 cilent_socket = None
@@ -156,19 +167,6 @@ def receive_server_data():
             if not data:
                 continue
             recv_buffer.extend(data)
-            # print(data)
-            # 这里要解析二进制数据了，发送时格式：
-            # 遍历positions，按小端序写
-            # for _, pos := range positions {
-            #     _ = binary.Write(buf, binary.LittleEndian, pos.ID)
-            #     _ = binary.Write(buf, binary.LittleEndian, pos.X)
-            #     _ = binary.Write(buf, binary.LittleEndian, pos.Y)
-            # }
-            # binData := buf.Bytes()
-            #
-            #
-            #
-
             # 读包头
             while len(recv_buffer) >= HEADER_SIZE:
                 # 取包头字节(1+2)
@@ -198,8 +196,8 @@ def receive_server_data():
 
 
 def handle_server_message(msg_type, body_data):
-    global all_players
-    if msg_type == MSG_TYPE_POS:
+    if msg_type == SERVER_MSG_TYPE_POS:
+        global all_players
         # 清空旧帧数据
         all_players.clear()
 
@@ -214,12 +212,46 @@ def handle_server_message(msg_type, body_data):
             # 解析单个玩家
             player_id, x, y = struct.unpack("<HHH", player_bytes)
             all_players[player_id] = {"X": float(x)/10, "Y": float(y)/10}
+    elif msg_type == SERVER_MSG_TYPE_ENTER:
+        # - msgtype = 2为玩家进入
+        # 消息体为：
+        # - 玩家ID uint16 2字节
+        # - 是否是客户端自身的加入 bool 1字节
+        # - X轴坐标 uint16 2字节
+        # - Y轴坐标 uint16 2字节
+        # 消息体长:7字节
+        global self_player_id, ball
+        # 截取2字节ID数据
+        player_id = struct.unpack("<H", body_data[:2])[0]
+        # 看是否是自身,是就记录
+        is_self_enter = struct.unpack("<B", body_data[2:3])[0]
+        # 记录坐标
+        x, y = struct.unpack("<HH", body_data[3:7])
+        x = float(x)/10
+        y = float(y)/10
+        if is_self_enter:
+            self_player_id = player_id
+            ball.x = x
+            ball.y = y
+        # 否则的情况我们先不做，等后续再处理
 
 
 if connected:
     threading.Thread(target=receive_server_data, daemon=True).start()
 
+
 while True:
+    # 如果没有自己的ID，发送进入的消息，然后等待服务器分配
+    # 格式：
+    # 小端序, uint8消息类型 + uint16 消息体长度 + 消息体
+    # 对于加入游戏的指令，消息体为空,消息类型为1,长度为0
+    if self_player_id is None:
+        cilent_socket.sendall(struct.pack(
+            "<BH", MSG_TYPE_ENTER, MSG_SIZE_ENTER))
+        time.sleep(1)
+    if self_player_id is None:
+        exit(1)
+
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             pygame.quit()
@@ -260,7 +292,12 @@ while True:
     # 多人模式：显示其他玩家
     if connected:
         for idx, (pl_id, pos) in enumerate(all_players.items()):
-            pygame.draw.circle(screen, (0, 255, 0),
+            # 是自己就用黄色标记，不然就用绿的
+            if pl_id == self_player_id:
+                color = (255, 255, 0)
+            else:
+                color = (0, 255, 0)
+            pygame.draw.circle(screen, color,
                                (pos["X"], pos["Y"]), 20)
 
     pygame.draw.circle(screen, ball.color, (ball.x, ball.y), ball.r)  # 自己在最上层
@@ -275,7 +312,12 @@ while True:
     if connected:
         x_int = round(ball.x * 10)
         y_int = round(ball.y * 10)
-        bin_data = struct.pack("<HH", x_int, y_int)
+        # uint8 的3为小球位置同步(等待弃用，只是中途用)
+        # 消息体包括：
+        # X轴坐标 uint16 2字节
+        # Y轴坐标 uint16 2字节
+        bin_data = struct.pack("<BHHH", MSG_TYPE_POS,
+                               MSG_SIZE_POS, x_int, y_int)
         cilent_socket.send(bin_data)
 
     screen.blit(text, (10, 10))

@@ -157,3 +157,203 @@ uint16范围为0-2e16 = 0 - 65535，
 ##  我完成了修改
 目前500球下流畅，客户端也没有闪烁情况。  
 ---
+
+
+---
+## 26.04.08
+问题：目前使用状态同步，为学习指令同步，我决定改为指令同步。
+指令同步会把玩家A的指令推送给所有其他玩家，然后其他玩家根据指令更新自己的状态。无需服务器进行状态更新。
+
+目标：
+完成服务端的接收消息->解析->丢给战局内队列->完成每帧处理消息-广播-tick的同步循环。
+
+规定：
+- 客户端->服务端消息格式:
+
+    - msgtype = 1为玩家进入
+        消息体为空
+        消息体长:0字节
+
+    - msgtype = 2为小球移动
+        消息体包括：
+        - X轴速度 int8(-128-127) 1字节 
+        - Y轴速度 int8(-128-127) 1字节 
+        (似乎也可以用轴坐标来表示，应该也是2字节足够)
+        消息体长:2字节
+    
+    - msgtype = 3为小球位置同步(等待弃用，只是中途用)
+        消息体包括：
+        - X轴坐标 uint16 2字节
+        - Y轴坐标 uint16 2字节
+        消息体长:4字节
+
+- 服务端->客户端消息格式:
+
+    - msgtype = 2为玩家进入
+        消息体为：
+        - 玩家ID uint16 2字节
+        - 是否是客户端自身的加入 bool 1字节
+        - X轴坐标 uint16 2字节
+        - Y轴坐标 uint16 2字节
+        消息体长:7字节
+
+    - msgtype = 3为小球移动
+        消息体包括：
+        - 玩家ID uint16 2字节
+        - X轴速度 int8(-128-127) 1字节 
+        - Y轴速度 int8(-128-127) 1字节 
+        消息体长:4字节
+
+
+因为此时服务器只负责转发即可，无需进行状态更新，我们可以把Ball等结构体直接舍弃。
+
+服务端建立一个帧操作队列(chan)，用于接收客户端发送的指令。
+随后，把指令从队列中取出，广播给所有其他玩家。
+客户端可以设置一个检测，检查指令是否由自己发起，如果是那就忽略掉。
+
+客户端进入->服务端接受->返回ID->客户端存储ID用于检测
+
+
+
+## 关于消息分发
+我们目前已经对每个客户端建立一个goroutine进行从写通道到实际写入链接的写入，
+但目前没有一个方便的函数用于将消息分发给指定客户端的写通道。
+鉴于无论是状态同步还是指令同步，都离不开全量广播，因此这个函数尤为重要，复用性很高。
+
+下面的spread_positions函数已经初见端倪，我们可以进行修改以适配需要。
+```
+func spread_positions() {
+	for binData := range broadcast_chan {
+		writing_chans_Mu.Lock()
+		for conn, ch := range writing_chans {
+			select {
+			case ch <- binData:
+			default:
+				fmt.Println("Write to client_w_chan failed:", conn.RemoteAddr())
+			}
+		}
+		writing_chans_Mu.Unlock()
+	}
+}
+```
+在目前的实现中，由于直接从broadcast_chan中取出消息，其类型为[]byte,没有ID以进行识别
+所以不方便做到剔除客户端自身的消息。
+这可以在客户端中进行过滤，因为消息本身带有ID。
+- 若选择从消息中读取ID，是否慢？？不慢的话可能可行。
+- 认为，二进制解析非常快，不会影响性能，因此我们可以直接从消息中读取ID。
+
+## 关于服务端读取时缓冲区大小选取的重要问题
+```
+	// 接收消息，开始解析
+	buf := make([]byte, 1024)
+	for {
+		//读1字节uint8的消息类型
+		n, err := io.ReadFull(conn, buf[0:1])
+		if err != nil || n != 1 {
+			return
+		}
+		msgType := buf[0]
+		//读2字节uint16的消息长度
+		n, err = io.ReadFull(conn, buf[1:3])
+		if err != nil || n != 2 {
+			return
+		}
+		msgLen := binary.LittleEndian.Uint16(buf[1:3])
+		//剩下的是消息体
+		msgData := buf[3:]
+		fmt.Println("Received message:", msgType, msgLen, msgData)
+		//检查消息体长度是否正确
+		if uint16(len(msgData)) != msgLen {
+			fmt.Println("Invalid message length:", msgType, msgLen, msgData)
+			return
+		}
+		//构造InGameMsg,送chan
+		msg := InGameMsg{
+			Conn:    conn,
+			MsgType: msgType,
+			MsgData: msgData,
+		}
+		//放不进去就不放了，算丢弃
+		select {
+		case ingame_process_msg_chan <- msg:
+		default:
+		}
+	}
+```
+这样的代码是不对的，因为buf建立了1024字节的固定大小切片，
+使用其进行读取时，其消息体必然是1024-3 = 1021字节。
+重要：这里切片不会自动缩容，因此使用msgLen的比较必然无效。
+- 服务端必须严格按照 msgLen 读取 exactly N 字节的消息体，而不是直接用切片剩余空间！
+
+## 对于在严格帧同步(每帧处理一次-发送一次消息)时消息分发函数的阻塞问题
+```
+func write_chan_msg_for_all_clients() {
+	//这是通用的全量广播函数，不作区分
+	for binData := range broadcast_chan {
+		writing_chans_Mu.RLock()
+		for conn, ch := range writing_chans {
+			select {
+			case ch <- binData:
+			default:
+				fmt.Println("Write to client_w_chan failed:", conn.RemoteAddr())
+			}
+		}
+		writing_chans_Mu.RUnlock()
+	}
+}
+```
+上面的函数适合单独开协程运行，不可以在帧同步中调用。
+原因是，for binData := range broadcast_chan该条件在broadcast_chan为空时，会阻塞。
+由于不是每次都有消息，所以该写法会导致严重问题。
+可以使用for+ select来实现非阻塞的读取,注意for必须有限次数，否则会导致死循环。
+这里我for次数改为了与broadcast_chan的容量相同，即125。
+
+
+## 关于Go写入binData必须加类型的问题
+_ = binary.Write(buf_other, binary.LittleEndian, uint16(640))
+以上是正确的
+但是
+_ = binary.Write(buf_other, binary.LittleEndian, 640)
+这样的是错误的，因为具体类型未知
+
+binary.Write 要求传入固定大小、明确类型的数据，不能传入无类型的数字字面量（如 640），也不能传入平台相关的 int/uint 类型。
+你必须显式指定类型（如 uint16(640)），否则函数无法确定要写入多少字节的二进制数据。
+
+// 标准库 encoding/binary 包
+func Write(w io.Writer, order ByteOrder, data any) error
+虽然data是接口，接受任意类型值，但是函数底层依赖反射，必须知道 data 的具体类型和固定字节长度，才能把数据转换成二进制字节。
+
+如果你binary.Write(buf_other, binary.LittleEndian, 640)这么写，实际上640根本不会写入，但是也不报错。
+需要特别注意这一点。
+
+## 关于重复读锁(锁重入)错误
+```
+func write_message_for_client(conn net.Conn, binData []byte) {
+	//这是通用的单客户端广播函数
+	writing_chans_Mu.RLock()
+	select {
+	case writing_chans[conn] <- binData:
+	default:
+		fmt.Println("Write to client_w_chan failed:", conn.RemoteAddr())
+	}
+	writing_chans_Mu.RUnlock()
+}
+
+func write_diff_msg_for_spc_client(spc_conn net.Conn, spc_binData []byte, other_binData []byte) {
+	//为指定连接写指定消息，其他的写其他消息
+	writing_chans_Mu.RLock()
+	for conn := range writing_chans {
+		if conn == spc_conn {
+			write_message_for_client(conn, spc_binData)
+			continue
+		}
+		write_message_for_client(conn, other_binData)
+	}
+	writing_chans_Mu.RUnlock()
+}
+
+```
+上面的代码有重复读锁错误，其导致问题。
+具体地：
+
+TODO 待续 26.04.08

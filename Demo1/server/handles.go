@@ -50,7 +50,7 @@ func handle_connection(conn net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		handle_position(conn)
+		receive_client_msg(conn)
 	}()
 	go func() {
 		defer wg.Done()
@@ -59,19 +59,53 @@ func handle_connection(conn net.Conn) {
 	wg.Wait()
 }
 
-func handle_position(conn net.Conn) {
-	buf := make([]byte, 4) // 固定读4字节（2+2 uint16）
+func receive_client_msg(conn net.Conn) {
+	// 之前的处理弃用
+	// buf := make([]byte, 4) // 固定读4字节（2+2 uint16）
+	// for {
+	// 	n, err := io.ReadFull(conn, buf)
+	// 	if err != nil || n != 4 {
+	// 		return
+	// 	}
+	// 	x := binary.LittleEndian.Uint16(buf[0:2])
+	// 	y := binary.LittleEndian.Uint16(buf[2:4])
+
+	// 	cilents_Mu.RLock()
+	// 	cilents[conn].SetXY(x, y)
+	// 	cilents_Mu.RUnlock()
+	//}
+
 	for {
-		n, err := io.ReadFull(conn, buf)
-		if err != nil || n != 4 {
+		buf := make([]byte, 3) //消息头和长度信息
+		//读1字节uint8的消息类型
+		n, err := io.ReadFull(conn, buf[0:1])
+		if err != nil || n != 1 {
 			return
 		}
-		x := binary.LittleEndian.Uint16(buf[0:2])
-		y := binary.LittleEndian.Uint16(buf[2:4])
-
-		cilents_Mu.RLock()
-		cilents[conn].SetXY(x, y)
-		cilents_Mu.RUnlock()
+		msgType := buf[0]
+		//读2字节uint16的消息长度
+		n, err = io.ReadFull(conn, buf[1:3])
+		if err != nil || n != 2 {
+			return
+		}
+		msgLen := binary.LittleEndian.Uint16(buf[1:3])
+		//剩下的是消息体
+		msgData := make([]byte, msgLen)
+		n, err = io.ReadFull(conn, msgData)
+		if err != nil || n != int(msgLen) {
+			return
+		}
+		//构造InGameMsg,送chan
+		msg := InGameMsg{
+			Conn:    conn,
+			MsgType: msgType,
+			MsgData: msgData,
+		}
+		//放不进去就不放了，算丢弃
+		select {
+		case ingame_process_msg_chan <- msg:
+		default:
+		}
 	}
 }
 
@@ -80,5 +114,6 @@ func handle_write_to_client(conn net.Conn) {
 		if _, err := conn.Write(text); err != nil {
 			return
 		}
+		//fmt.Println("Sent message:", text, "to", conn.RemoteAddr())
 	}
 }
