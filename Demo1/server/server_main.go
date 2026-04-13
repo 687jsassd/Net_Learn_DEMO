@@ -15,13 +15,17 @@ const (
 	Port                    = ":16543"
 	GameLoopInterval        = 16 * time.Millisecond //近似64tick
 	Single_BallPostion_Size = 6                     //2字节X，2字节Y，2字节ID
+
+	BallRadius = 200   //小球半径 20*10 =200
+	Width      = 12800 //游戏窗口宽度 1280
+	Height     = 8000  //游戏窗口高度 800
 )
 
 var (
 	cur_max_ball_id    uint16 //当前最大球ID，暂时用这个
 	cur_max_ball_id_Mu sync.Mutex
 
-	broadcast_chan = make(chan []byte, 125) //collect_positions的数据，通过该chan移交给spread_positions协程
+	broadcast_chan = make(chan []byte, 2000) //collect_positions的数据，通过该chan移交给spread_positions协程
 
 	cilents    = make(map[net.Conn]*BallObj)
 	cilents_Mu sync.RWMutex
@@ -29,7 +33,7 @@ var (
 	writing_chans    = make(map[net.Conn]chan []byte) //为每个链接开一个chan，以写入数据
 	writing_chans_Mu sync.RWMutex
 
-	ingame_process_msg_chan = make(chan InGameMsg, 125)
+	ingame_process_msg_chan = make(chan *InGameMsg, 2000)
 )
 
 type InGameMsg struct {
@@ -94,12 +98,12 @@ func ingame_process_loop() {
 	for {
 		time.Sleep(GameLoopInterval)
 
-		// 只处理125条消息，其他的下一帧再处理
-		for i := 0; i < 125; i++ {
+		// 只处理2000条消息，其他的下一帧再处理
+		for i := 0; i < 2000; i++ {
 			select {
 			case msg := <-ingame_process_msg_chan:
 				// 处理消息
-				process_ingame_msg(msg)
+				process_ingame_msg(*msg)
 			default:
 			}
 		}
@@ -141,21 +145,78 @@ func process_ingame_msg(msg InGameMsg) {
 		_ = binary.Write(buf_other, binary.LittleEndian, uint16(3600))
 		other_binData := buf_other.Bytes()
 		cilents_Mu.RUnlock()
-		fmt.Println("Reply msg constructed")
+		cilents_Mu.Lock()
+		cilents[msg.Conn].SetXY(6400, 3600)
+		cilents_Mu.Unlock()
 		write_diff_msg_for_spc_client(msg.Conn, binData, other_binData)
-	case 3: //位置同步(待弃用)
-		// - msgtype = 3为小球位置同步
+	case 2: //移动指令
+		// - msgtype = 2为小球移动
 		// 消息体包括：
-		// - X轴坐标 uint16 2字节
-		// - Y轴坐标 uint16 2字节
-		// 消息体长:4字节
+		// - 移动方式 uint8 1字节
+		// 消息体长:1字节
 
 		//无需发送给客户端消息，这里根据收到的做同步即可
-		x := binary.LittleEndian.Uint16(msg.MsgData[0:2])
-		y := binary.LittleEndian.Uint16(msg.MsgData[2:4])
-
+		move_direction := msg.MsgData[0]
+		cilents_Mu.RLock()
+		cur_x, cur_y := cilents[msg.Conn].GetXY()
+		cilents_Mu.RUnlock()
+		//使用函数作安全加减，避免溢出问题
+		SafeSub := func(x, n, min uint16) uint16 {
+			if x <= n || x-n < min {
+				return min
+			}
+			return x - n
+		}
+		SafeAdd := func(x, n, max uint16) uint16 {
+			if x+n > max {
+				return max
+			}
+			return x + n
+		}
+		switch move_direction {
+		case 1: //上
+			cur_y = SafeSub(cur_y, 50, BallRadius)
+		case 2: //下
+			cur_y = SafeAdd(cur_y, 50, Height-BallRadius)
+		case 3: //左
+			cur_x = SafeSub(cur_x, 50, BallRadius)
+		case 4: //右
+			cur_x = SafeAdd(cur_x, 50, Width-BallRadius)
+		case 5: //左上
+			cur_x = SafeSub(cur_x, 50, BallRadius)
+			cur_y = SafeSub(cur_y, 50, BallRadius)
+		case 6: //右上
+			cur_x = SafeAdd(cur_x, 50, Width-BallRadius)
+			cur_y = SafeSub(cur_y, 50, BallRadius)
+		case 7: //左下
+			cur_x = SafeSub(cur_x, 50, BallRadius)
+			cur_y = SafeAdd(cur_y, 50, Height-BallRadius)
+		case 8: //右下
+			cur_x = SafeAdd(cur_x, 50, Width-BallRadius)
+			cur_y = SafeAdd(cur_y, 50, Height-BallRadius)
+		case 11: //加速上
+			cur_y = SafeSub(cur_y, 100, BallRadius)
+		case 12: //加速下
+			cur_y = SafeAdd(cur_y, 100, Height-BallRadius)
+		case 13: //加速左
+			cur_x = SafeSub(cur_x, 100, BallRadius)
+		case 14: //加速右
+			cur_x = SafeAdd(cur_x, 100, Width-BallRadius)
+		case 15: //加速左上
+			cur_x = SafeSub(cur_x, 100, BallRadius)
+			cur_y = SafeSub(cur_y, 100, BallRadius)
+		case 16: //加速右上
+			cur_x = SafeAdd(cur_x, 100, Width-BallRadius)
+			cur_y = SafeSub(cur_y, 100, BallRadius)
+		case 17: //加速左下
+			cur_x = SafeSub(cur_x, 100, BallRadius)
+			cur_y = SafeAdd(cur_y, 100, Height-BallRadius)
+		case 18: //加速右下
+			cur_x = SafeAdd(cur_x, 100, Width-BallRadius)
+			cur_y = SafeAdd(cur_y, 100, Height-BallRadius)
+		}
 		cilents_Mu.Lock()
-		cilents[msg.Conn].SetXY(x, y)
+		cilents[msg.Conn].SetXY(cur_x, cur_y)
 		cilents_Mu.Unlock()
 
 	default:
@@ -166,7 +227,7 @@ func process_ingame_msg(msg InGameMsg) {
 func collect_positions() {
 	buf := new(bytes.Buffer)
 	cilents_Mu.RLock()
-	clients_nums := len(cilents) //收集一下数量，后面分配切片大小直接分配
+	clients_nums := len(cilents)
 	if clients_nums == 0 {
 		cilents_Mu.RUnlock()
 		return

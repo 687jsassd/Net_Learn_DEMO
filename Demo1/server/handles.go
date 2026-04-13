@@ -60,21 +60,6 @@ func handle_connection(conn net.Conn) {
 }
 
 func receive_client_msg(conn net.Conn) {
-	// 之前的处理弃用
-	// buf := make([]byte, 4) // 固定读4字节（2+2 uint16）
-	// for {
-	// 	n, err := io.ReadFull(conn, buf)
-	// 	if err != nil || n != 4 {
-	// 		return
-	// 	}
-	// 	x := binary.LittleEndian.Uint16(buf[0:2])
-	// 	y := binary.LittleEndian.Uint16(buf[2:4])
-
-	// 	cilents_Mu.RLock()
-	// 	cilents[conn].SetXY(x, y)
-	// 	cilents_Mu.RUnlock()
-	//}
-
 	for {
 		buf := make([]byte, 3) //消息头和长度信息
 		//读1字节uint8的消息类型
@@ -103,7 +88,7 @@ func receive_client_msg(conn net.Conn) {
 		}
 		//放不进去就不放了，算丢弃
 		select {
-		case ingame_process_msg_chan <- msg:
+		case ingame_process_msg_chan <- &msg:
 		default:
 		}
 	}
