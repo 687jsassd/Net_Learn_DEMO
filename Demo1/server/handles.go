@@ -1,6 +1,8 @@
 package main
 
 import (
+	"demo1-server/ingame"
+	"demo1-server/model"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -29,14 +31,16 @@ func handle_connection(conn net.Conn) {
 	}()
 
 	//获取ID
-	cur_max_ball_id_Mu.Lock()
-	cur_max_ball_id++ //先加，因为ID=0被认定为无效
-	newID := cur_max_ball_id
-	cur_max_ball_id_Mu.Unlock()
+	newID := ingame.GetBallID()
+	defer ingame.ReturnBallID(newID)
+	if newID == 0 {
+		fmt.Println("No available ball ID")
+		return
+	}
 
 	//加Ball相关映射到map
 	cilents_Mu.Lock()
-	cilents[conn] = &BallObj{ID: newID}
+	cilents[conn] = &ingame.BallObj{ID: newID}
 	cilents_Mu.Unlock()
 
 	//开一个写chan
@@ -81,7 +85,7 @@ func receive_client_msg(conn net.Conn) {
 			return
 		}
 		//构造InGameMsg,送chan
-		msg := InGameMsg{
+		msg := model.InGameMsg{
 			Conn:    conn,
 			MsgType: msgType,
 			MsgData: msgData,

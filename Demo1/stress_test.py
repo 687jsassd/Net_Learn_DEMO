@@ -7,7 +7,7 @@ import struct
 # ===================== 配置常量（与客户端完全一致）=====================
 SERVER_IP = "127.0.0.1"
 SERVER_PORT = 16543
-SIMULATE_COUNT = 180  # 模拟客户端数量
+SIMULATE_COUNT = 999  # 模拟客户端数量
 WIDTH, HEIGHT = 1280, 800
 TICK_RATE = 64  # 同步帧率
 
@@ -73,7 +73,7 @@ def simulate_ball(client_id):
             # 清空服务端广播数据，避免缓冲区积压
             try:
                 sock.setblocking(False)
-                while sock.recv(4096):
+                while sock.recv(16384):
                     pass
                 sock.setblocking(True)
             except BlockingIOError:

@@ -8,6 +8,8 @@ import threading
 from collections import deque
 import struct
 
+# =========================常量和初始化=========================
+
 pygame.init()
 
 WIDTH, HEIGHT = 1280, 800
@@ -30,9 +32,9 @@ SERVER_MSG_TYPE_ENTER = 2  # 加入游戏消息
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
 pygame.display.set_caption("Demo1-Cilent")
 
+
+# =========================类定义=========================
 # 小球参数
-
-
 class Ball:
     def __init__(self, x, y, r, color, speed):
         self.x = x
@@ -59,9 +61,8 @@ class Ball:
         if self.y + self.r > HEIGHT:
             self.y = HEIGHT - self.r
 
+
 # 轨迹类
-
-
 class Trail:
     """
     轨迹，用于记录小球移动路线
@@ -133,28 +134,36 @@ class Trail:
                              points_list[i], points_list[i+1], 3)
 
 
+# =========================全局变量=========================
 # 线程锁
 player_mutex = threading.Lock()
 recv_msg_count_lock = threading.Lock()
-# 每秒接收消息数，用于粗略估计性能
-recv_msg_count = 0
+
+# 用于粗略估计性能的变量
+recv_msg_count = 0  # 每秒接收消息数
+recv_msg_byte_count = 0  # 每秒接收消息字节数
+cur_max_player_id = 0  # 当前最大玩家ID
+
+display_msg_count = 0  # 显示的消息数
+display_byte_count = 0  # 显示的字节数
+
 # 所有玩家(ID:(X,Y))
 all_players = {}
+
 # 时钟
 clock = pygame.time.Clock()
+
 # 自己小球
 ball = Ball(WIDTH // 2, HEIGHT // 2, 20, (255, 0, 0), 5)
 self_player_id = None
 
-# ===================== 新增：性能统计全局变量 =====================
 last_msg_update_time = time.time()  # 上次统计消息数的时间
-msg_per_second = 0                  # 每秒接收的消息条数
 info_font = pygame.font.Font(None, 36)  # 预创建字体，优化性能
-# ================================================================
 
 # 网络连接相关变量
 cilent_socket = None
 connected = False
+# =========================网络连接处理=========================
 
 try:
     cilent_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -169,14 +178,16 @@ except Exception as e:
 
 def receive_server_data():
     """接收服务器数据"""
-    global recv_msg_count
+    global recv_msg_count, recv_msg_byte_count, connected
     recv_buffer = bytearray()
     while True:
         if not connected:
             break
         try:
-            data = cilent_socket.recv(4096)
+            data = cilent_socket.recv(16384)
             if not data:
+                print("Server closed connection.")
+                connected = False
                 continue
             recv_buffer.extend(data)
             # 读包头
@@ -188,10 +199,9 @@ def receive_server_data():
                 # 总数据长度
                 full_packet_len = HEADER_SIZE + body_len
 
-                # 等待缓存区包
-                while len(recv_buffer) < full_packet_len:
-                    break
-
+                # 检验半包
+                if len(recv_buffer) < full_packet_len:
+                    continue
                 # 取包
                 full_packet = recv_buffer[:full_packet_len]
                 del recv_buffer[:full_packet_len]
@@ -204,6 +214,7 @@ def receive_server_data():
                 # 统计接收消息数
                 with recv_msg_count_lock:
                     recv_msg_count += 1
+                    recv_msg_byte_count += full_packet_len
 
         except Exception as e:
             print("Receive server error:", e)
@@ -248,6 +259,8 @@ def handle_server_message(msg_type, body_data):
 if connected:
     threading.Thread(target=receive_server_data, daemon=True).start()
 
+
+# =========================主循环=========================
 while True:
     # 如果没有自己的ID，发送进入的消息，然后等待服务器分配
     if self_player_id is None:
@@ -288,18 +301,20 @@ while True:
     elif keys[pygame.K_DOWN]:
         move_direction += 4 if move_direction else 2
         ball.y = min(ball.y + ball.cur_speed, HEIGHT - ball.r)
-    if is_accel:
+    if is_accel and move_direction:
         move_direction += 10
 
     screen.fill((0, 0, 0))
 
-    # ===================== 新增：每秒消息数统计 =====================
+    # ===================== 统计 =====================
     current_time = time.time()
     # 每1秒更新一次接收消息数
     if current_time - last_msg_update_time >= 1.0:
         with recv_msg_count_lock:
-            msg_per_second = recv_msg_count
+            display_msg_count = recv_msg_count
+            display_byte_count = recv_msg_byte_count
             recv_msg_count = 0
+            recv_msg_byte_count = 0
         last_msg_update_time = current_time
     # 获取实时FPS
     current_fps = clock.get_fps()
@@ -345,24 +360,27 @@ while True:
     if connected:
         with player_mutex:
             player_count = len(all_players)
-        player_count_text = f"Players:{player_count}"
+            cur_max_player_id = max(all_players.keys())
+        player_count_text = f"Players:{player_count} - Max ID:{cur_max_player_id}"
         player_count_surface = info_font.render(
             player_count_text, True, (255, 255, 255))
         screen.blit(player_count_surface, (10, 50))
 
-    # ===================== 新增：渲染FPS和每秒消息数 =====================
     # 渲染FPS（青色）
     fps_surface = info_font.render(
         f"FPS: {current_fps:.1f}", True, (0, 255, 255))
     screen.blit(fps_surface, (10, 90))
     # 渲染每秒接收消息数（绿色）
     msg_surface = info_font.render(
-        f"Recv Msg/s: {msg_per_second}", True, (0, 255, 0))
+        f"Recv Msg/s: {display_msg_count}", True, (0, 255, 0))
     screen.blit(msg_surface, (10, 130))
-    # ====================================================================
+    # 渲染每秒接收字节数（黄色）
+    byte_surface = info_font.render(
+        f"Recv Byte/s: {display_byte_count} (~{display_byte_count/60:.2f}B/pkg)", True, (255, 255, 0))
+    screen.blit(byte_surface, (10, 170))
 
     # 发送位置（仅在连接时）
-    if connected:
+    if connected and move_direction:
         bin_data = struct.pack("<BHB", MSG_TYPE_MOVE,
                                MSG_SIZE_MOVE, move_direction)
         cilent_socket.send(bin_data)
