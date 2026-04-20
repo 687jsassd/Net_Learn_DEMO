@@ -699,6 +699,8 @@ var(
 使用空闲栈+自增策略，来实现ID的重用池，应该是更好的选择，
 在上述的基础上，把小根堆换成栈，这样全操作O(1)，而且无序，而且保证了不预先分配空间！
 
+我采用的是空闲栈+自增的策略，目前表现良好，达到了正确复用效果。
+
 ## 关于项目重构
 目前项目结构全程放在两个文件中，很臃肿。
 经过修改，目前分为下面的结构:
@@ -723,3 +725,216 @@ server:
 约1200的小球的情况下，出现未知的bug，可能是Windows单进程句柄限制，后续进行研究。
 ![1000ok](./pic/1000ok.png)
 26.04.19
+
+
+---
+## 26.04.20
+## 关于连接标识符的设计的严重错误，以及继续的项目重构
+今日目前需要解决的问题是使用IP(net.Conn)作为连接标识符的错误设计
+因为在本地测试中，IP地址相同，只有端口不同（操作系统会自动分配不同的临时端口），不出现重用，所以本地测试没问题。这是本地无NAT、复用、重连的理想环境。
+但是实际运行中，NAT 共享公网 IP，会出现大量重复标识；多个设备共用同一个公网 IP，不同设备完全可能被映射成相同公网端口；客户端重连必定端口改变；网络切换时连接也会改变。
+
+IP+端口是网络层标识，是TCP连接的五元组的一部分。
+而玩家/客户端应该用业务层的唯一的ID标识，这样才不违反网络标识≠业务身份的基本设计原则
+
+考虑使用下面的方案：
+客户端连接时，服务端立刻返回一user_id，客户端后续操作都用user_id来标识。
+服务端根据user_id来判断客户端是否是同一个玩家。
+user_id使用uint32类型，不重用。
+
+客户端在通信时，消息带有user_id。
+
+我完全重构了业务层，使用Session会话来进行管理，抛弃了原本的多map分别管理通道、小球对象的设计；
+这种设计更结构化，且通过统一的锁和方法进行处理。
+
+将gameloop, msg_handle, session管理等都放到ingame包下。
+
+完成了连接时ID认证，完成持久化的战局状态，不会因为玩家退出而认为游戏对象退出，为后续持久化战局和断线重连提供了基础。
+
+使用uint32的BallID作为user_id赋予会话session，session管理连接并提供替换性，解决了连接标识符的原有设计缺陷。
+
+完成了基本的断线重连逻辑和会话生命周期管理。
+
+提取各配置项，放到config包下。
+
+## 关于一关键的select是否加default的问题
+以下面的代码为例：
+```
+func handle_write_to_client(session *ClientSession) {
+	for {
+		select {
+		case data, ok := <-session.writeChan:
+			if !ok {
+				return
+			}
+			conn := session.GetConn()
+			if conn == nil {
+				return
+			}
+			if _, err := conn.Write(data); err != nil {
+				return
+			}
+		case <-session.done:
+			return
+		}
+	}
+}
+```
+该代码已经经过优化，目前没有default分支，大部分时间都在select中等待。
+一旦添加了default分支，就会在其他分支不满足时，执行default分支，立刻进行循环。
+严重问题是，这样设计会导致空转，尤其是该函数当作每一个连接的写协程
+一旦添加了default分支，会导致成百上千的写协程空转，浪费CPU资源，最终导致资源耗尽。
+通俗点说，那就是死循环！！而且是一堆死循环。
+
+典型的报错信息：
+```
+goroutine 1099 [runnable]:
+demo1-server/ingame.handle_write_to_client(0xc000996230)
+        D:/Code/Go/Net_Learn_DEMO/Demo1/server/ingame/conn_handle.go:146 +0x45
+demo1-server/ingame.Handle_connection.func2()
+        D:/Code/Go/Net_Learn_DEMO/Demo1/server/ingame/conn_handle.go:72 +0x47
+created by demo1-server/ingame.Handle_connection in goroutine 1255
+        D:/Code/Go/Net_Learn_DEMO/Demo1/server/ingame/conn_handle.go:70 +0x566
+
+goroutine 1100 [sync.WaitGroup.Wait]:
+sync.runtime_SemacquireWaitGroup(0xc001006060?)       
+        C:/Program Files/Go/src/runtime/sema.go:110 +0x25
+sync.(*WaitGroup).Wait(0xb5cfc0?)
+        C:/Program Files/Go/src/sync/waitgroup.go:118 +0x48
+demo1-server/ingame.Handle_connection({0xb60f70, 0xc00031e0b0})
+        D:/Code/Go/Net_Learn_DEMO/Demo1/server/ingame/conn_handle.go:74 +0x573
+created by main.main in goroutine 1
+        D:/Code/Go/Net_Learn_DEMO/Demo1/server/main.go:38 +0x298
+
+goroutine 1101 [runnable]:
+internal/poll.runtime_pollWait(0x2aae27a42a8, 0x72)   
+        C:/Program Files/Go/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0x0?, 0x0?, 0x0)       
+        C:/Program Files/Go/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.execIO(0xc001012020, 0xb014a8)
+        C:/Program Files/Go/src/internal/poll/fd_windows.go:177 +0x105
+internal/poll.(*FD).Read(0xc001012008, {0xc000a12416, 0x1, 0x3})
+        C:/Program Files/Go/src/internal/poll/fd_windows.go:438 +0x29b
+net.(*netFD).Read(0xc001012008, {0xc000a12416?, 0x0?, 0x0?})
+        C:/Program Files/Go/src/net/fd_posix.go:55 +0x25
+net.(*conn).Read(0xc00031e0b0, {0xc000a12416?, 0xc00100df20?, 0x806489?})
+        C:/Program Files/Go/src/net/net.go:194 +0x45  
+io.ReadAtLeast({0x2aae24f40c0, 0xc00031e0b0}, {0xc000a12416, 0x1, 0x3}, 0x1)
+        C:/Program Files/Go/src/io/io.go:335 +0x91    
+io.ReadFull(...)
+        C:/Program Files/Go/src/io/io.go:354
+conn_handle.go:66 +0x50f
+
+goroutine 1102 [chan receive]:
+demo1-server/ingame.handle_write_to_client(0xc000996280)
+        D:/Code/Go/Net_Learn_DEMO/Demo1/server/ingame/conn_handle.go:146 +0x45
+demo1-server/ingame.Handle_connection.func2()
+        D:/Code/Go/Net_Learn_DEMO/Demo1/server/ingame/conn_handle.go:72 +0x47
+created by demo1-server/ingame.Handle_connection in goroutine 1100
+        D:/Code/Go/Net_Learn_DEMO/Demo1/server/ingame/conn_handle.go:70 +0x566
+exit status 2
+```
+
+典型的block分析结果：
+```
+(pprof) top
+Showing nodes accounting for 22.65s, 100% of 22.65s total
+Dropped 38 nodes (cum <= 0.11s)
+      flat  flat%   sum%        cum   cum%
+    22.53s 99.47% 99.47%     22.53s 99.47%  runtime.chanrecv1
+     0.12s  0.52%   100%      0.12s  0.52%  sync.(*RWMutex).Lock
+         0     0%   100%      0.12s  0.52%  demo1-server/ingame.(*ClientSession).SwitchEntered
+         0     0%   100%      0.12s  0.52%  demo1-server/ingame.Ingame_process_loop
+         0     0%   100%      0.12s  0.52%  demo1-server/ingame.process_ingame_msg
+         0     0%   100%     22.53s 99.47%  runtime.unique_runtime_registerUniqueMapCleanup.func2
+```
+参考字段：
+| 字段 | 解释 |
+|---|---|
+| flat | 函数自己阻塞的时间（纯自身耗时） |
+| flat% | 自身阻塞时间占总阻塞的比例 |
+| sum% | 函数 + 它调用的子函数 总阻塞时间 |
+| cum | 函数 + 它调用的子函数 总阻塞时间 |
+| 函数名 | 阻塞的位置 |
+
+chanrecv1 是 Go 底层通道接收函数，代表：大量协程卡在「读取通道」的操作上，动不了！
+sync.(*RWMutex).Lock 占 0.52%，代表读写锁阻塞，对应代码里可能滥用锁的问题
+- 注意！通道并发安全，不要在对通道操作时加锁，画蛇添足！
+
+不佳的错误代码示例，该代码因为添加default分支，导致空转。
+(pprof模式下使用list + 函数名 查看该函数的详细信息)
+```
+0    38.84us (flat, cum) 0.00017% of Total
+.          .    145:func handle_write_to_client(session *ClientSession) {
+.          .    146:   for {
+.          .    147:           select {
+.          .    148:           case data := <-session.writeChan:
+.          .    149:                   if _, err := session.GetConn().Write(data); err != nil {
+.          .    150:                           return
+.          .    151:                   }
+.          .    152:           default:
+.    38.84us    153:                   conn := session.GetConn()
+.          .    154:                   if conn == nil {
+.          .    155:                           return
+.          .    156:                   }
+.          .    157:           }
+.          .    158:
+
+```
+
+经过修改后，良好的1000球压测下的block top数据如下
+![good_1000balls_block](./pic/good_1000balls_block(260420).jpg)
+
+
+## pprof分析block和mutex时必要的设置：
+Go 语言的 block 阻塞采样、mutex 锁采样，默认是关闭的！
+必须入口添加
+```
+	// 开启阻塞采样 (1=记录所有阻塞)
+	runtime.SetBlockProfileRate(1)
+	// 开启锁竞争采样 (1=记录所有锁竞争)
+	runtime.SetMutexProfileFraction(1)
+``` 
+否则得到的block和mutex文件是空文件，尝试使用go tool pprof block/mutex分析时，报错如下：
+```
+PS D:\Code\Go\Net_Learn_DEMO\Demo1\server> go tool pprof block
+File: demo1-server.exe
+Build ID: C:\Users\33658\AppData\Local\Temp\go-build2691954710\b001\exe\demo1-server.exe2026-04-20 19:33:38.3678576 +0800 CST
+Type: delay
+Time: 2026-04-20 19:49:21 CST
+No samples were found with the default sample value type.
+Try "sample_index" command to analyze different sample values.
+Entering interactive mode (type "help" for commands, "o" for options)
+(pprof) top
+Showing nodes accounting for 0, 0% of 0 total
+      flat  flat%   sum%        cum   cum%
+```
+
+良好的1000球压测下的mutex top数据如下
+![good_1000balls_mutex](./pic/good_1000balls_mutex(260420).jpg)
+
+trace数据：
+![good_1000balls_mutex_trace](./pic/good_1000balls_mutex_trace(260420).jpg)
+
+profile数据：
+![good_1000balls_profile](./pic/good_1000balls_profile(260420).jpg)
+
+
+
+## 需要注意的其他问题：
+chan 需要初始化！默认值是nil，不能直接使用。
+使用var a chan int = make(chan int,100) 的类似语法来初始化通道。
+
+
+## 总结
+目前完成了大重构，把各个模块分离开来，ingame战局内逻辑/main入口/config配置/model定义一些结构体等
+同时，使用pprof进行性能分析，并找到且解决问题。
+
+完成了对客户端的封装，可以通过会话session来统一获取或管理客户端状态。
+完成了基于ID（而非临时tcp连接）的正确架构改造，并在其基础上完成了断线重连机制和超时清理机制。
+
+在1000球测试下，性能良好，没有锁竞争，具体pprof数据如下。
+![good_1000balls_pprof(260420)](./pic/good_1000balls_pprof(260420).jpg)
+
+后续，可以在此基础上开始房间管理器的实现，进而实现匹配-战局的初步闭环
+

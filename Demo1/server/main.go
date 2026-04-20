@@ -1,32 +1,20 @@
 package main
 
 import (
-	"bytes"
 	"demo1-server/config"
 	"demo1-server/ingame"
-	"demo1-server/model"
-	"encoding/binary"
 	"fmt"
 	"net"
 	"net/http"
 	_ "net/http/pprof" // 下划线表示仅导入初始化，无需调用
-	"sync"
-	"time"
-)
-
-var (
-	broadcast_chan = make(chan []byte, 2000) //collect_positions的数据，通过该chan移交给spread_positions协程
-
-	cilents    = make(map[net.Conn]*ingame.BallObj)
-	cilents_Mu sync.RWMutex
-
-	writing_chans    = make(map[net.Conn]chan []byte) //为每个链接开一个chan，以写入数据
-	writing_chans_Mu sync.RWMutex
-
-	ingame_process_msg_chan = make(chan *model.InGameMsg, 2000)
+	"runtime"
 )
 
 func main() {
+	// 开启阻塞采样 (1=记录所有阻塞)
+	runtime.SetBlockProfileRate(1)
+	// 开启锁竞争采样 (1=记录所有锁竞争)
+	runtime.SetMutexProfileFraction(1)
 	go func() {
 		fmt.Println("pprof性能分析服务启动：http://127.0.0.1:6060/debug/pprof/")
 		_ = http.ListenAndServe(":6060", nil)
@@ -40,7 +28,7 @@ func main() {
 
 	fmt.Println("Listening port", config.Port)
 
-	go ingame_process_loop()
+	go ingame.Ingame_process_loop()
 
 	//接收处理链接
 
@@ -52,185 +40,7 @@ func main() {
 			continue
 		}
 		fmt.Println("Accept connection success:", conn.RemoteAddr())
-		go handle_connection(conn)
+		go ingame.Handle_connection(conn)
 	}
 
-}
-
-func ingame_process_loop() {
-	//64tick处理一次
-	//先处理消息，再收集位置，再广播，完成一次循环(1帧)
-	for {
-		time.Sleep(config.GameLoopInterval)
-
-		// 只处理2000条消息，其他的下一帧再处理
-		for i := 0; i < 2000; i++ {
-			select {
-			case msg := <-ingame_process_msg_chan:
-				// 处理消息
-				process_ingame_msg(*msg)
-			default:
-			}
-		}
-		// 收集位置
-		collect_positions()
-		// 广播位置
-		write_chan_msg_for_all_clients()
-	}
-}
-
-func process_ingame_msg(msg model.InGameMsg) {
-	switch msg.MsgType {
-	case 1: //玩家加入
-		// 消息体为空，返回给玩家消息格式如下：
-		// - msgtype = 2为玩家进入
-		// 消息体为：
-		// - 玩家ID uint16 2字节 （从cilents里面获取BallObj的ID就行）
-		// - 是否是客户端自身的加入 bool 1字节
-		// - X轴坐标 uint16 2字节 默认是6400(注意由于最后一位表示小数，实际是640.0)
-		// - Y轴坐标 uint16 2字节 默认是3600
-		// 消息体长:7字节
-
-		//构造对客户端自身的消息，因为包含是否是客户端自身的加入，所以需要区分
-		cilents_Mu.RLock()
-		buf := new(bytes.Buffer)
-		_ = binary.Write(buf, binary.LittleEndian, uint8(2))
-		_ = binary.Write(buf, binary.LittleEndian, uint16(7))
-		_ = binary.Write(buf, binary.LittleEndian, cilents[msg.Conn].ID)
-		_ = binary.Write(buf, binary.LittleEndian, true)
-		_ = binary.Write(buf, binary.LittleEndian, uint16(6400))
-		_ = binary.Write(buf, binary.LittleEndian, uint16(3600))
-		binData := buf.Bytes()
-		buf_other := new(bytes.Buffer)
-		_ = binary.Write(buf_other, binary.LittleEndian, uint8(2))
-		_ = binary.Write(buf_other, binary.LittleEndian, uint16(7))
-		_ = binary.Write(buf_other, binary.LittleEndian, cilents[msg.Conn].ID)
-		_ = binary.Write(buf_other, binary.LittleEndian, false)
-		_ = binary.Write(buf_other, binary.LittleEndian, uint16(6400))
-		_ = binary.Write(buf_other, binary.LittleEndian, uint16(3600))
-		other_binData := buf_other.Bytes()
-		cilents_Mu.RUnlock()
-		cilents_Mu.Lock()
-		cilents[msg.Conn].SetXY(6400, 3600)
-		cilents_Mu.Unlock()
-		write_diff_msg_for_spc_client(msg.Conn, binData, other_binData)
-	case 2: //移动指令
-		// - msgtype = 2为小球移动
-		// 消息体包括：
-		// - 移动方式 uint8 1字节
-		// 消息体长:1字节
-
-		move_direction := msg.MsgData[0]
-		cilents_Mu.RLock()
-		ball := cilents[msg.Conn] // 取出当前连接对应的小球
-		cilents_Mu.RUnlock()
-		ball.Move(move_direction)
-
-	default:
-		fmt.Println("Unknown message type:", msg.MsgType)
-	}
-}
-
-func collect_positions() {
-	buf := new(bytes.Buffer)
-	cilents_Mu.RLock()
-	clients_nums := len(cilents)
-	if clients_nums == 0 {
-		cilents_Mu.RUnlock()
-		return
-	}
-	//快速收集拷贝一遍所有客户端的数据
-	var positions []struct {
-		X, Y uint16
-		ID   uint16
-	}
-	for _, ball := range cilents {
-		if ball.ID == 0 {
-			continue
-		}
-		x, y := ball.GetXY()
-		positions = append(positions, struct {
-			X, Y uint16
-			ID   uint16
-		}{x, y, ball.ID})
-	}
-	cilents_Mu.RUnlock()
-
-	//写消息类型1,表示坐标同步
-	msgType := uint8(1) //1字节
-	_ = binary.Write(buf, binary.LittleEndian, msgType)
-
-	//写消息长度
-	msgLen := uint16(len(positions) * config.Single_BallPostion_Size) //2字节
-	_ = binary.Write(buf, binary.LittleEndian, msgLen)
-
-	//遍历positions，按小端序写
-	for _, pos := range positions {
-		_ = binary.Write(buf, binary.LittleEndian, pos.ID)
-		_ = binary.Write(buf, binary.LittleEndian, pos.X)
-		_ = binary.Write(buf, binary.LittleEndian, pos.Y)
-	}
-	binData := buf.Bytes()
-
-	select {
-	case broadcast_chan <- binData:
-	default:
-		select {
-		case <-broadcast_chan:
-		default:
-		}
-		broadcast_chan <- binData
-	}
-
-}
-
-func write_chan_msg_for_all_clients() {
-	//这是通用的全量广播函数，不作区分
-	for i := 0; i < 125; i++ {
-		select {
-		case binData := <-broadcast_chan:
-			writing_chans_Mu.RLock()
-			for conn, ch := range writing_chans {
-				select {
-				case ch <- binData:
-				default:
-					fmt.Println("Write to client_w_chan failed:", conn.RemoteAddr())
-				}
-			}
-			writing_chans_Mu.RUnlock()
-		default:
-		}
-	}
-}
-
-func write_message_for_client(conn net.Conn, binData []byte) {
-	//这是通用的单客户端广播函数
-	writing_chans_Mu.RLock()
-	select {
-	case writing_chans[conn] <- binData:
-	default:
-		fmt.Println("Write to client_w_chan failed:", conn.RemoteAddr())
-	}
-	writing_chans_Mu.RUnlock()
-}
-
-func write_diff_msg_for_spc_client(spc_conn net.Conn, spc_binData []byte, other_binData []byte) {
-	//为指定连接写指定消息，其他的写其他消息
-	writing_chans_Mu.RLock()
-	for conn, ch := range writing_chans {
-		if conn == spc_conn {
-			select {
-			case ch <- spc_binData:
-			default:
-				fmt.Println("Write to spc_conn failed:", conn.RemoteAddr())
-			}
-		} else {
-			select {
-			case ch <- other_binData:
-			default:
-				fmt.Println("Write to other_conn failed:", conn.RemoteAddr())
-			}
-		}
-	}
-	writing_chans_Mu.RUnlock()
 }

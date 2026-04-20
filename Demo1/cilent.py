@@ -17,11 +17,15 @@ WIDTH, HEIGHT = 1280, 800
 HEADER_SIZE = 3  # 1字节类型+2字节长度
 
 # 向服务端发送的消息的相关常量
+
+AUTH_NEW_CLIENT = 0x01  # 新客户端认证消息
+AUTH_OLD_CLIENT = 0x02  # 旧客户端认证消息
+
 MSG_TYPE_ENTER = 1  # 加入游戏消息
-MSG_SIZE_ENTER = 0  # 加入游戏消息体长度为0
+MSG_SIZE_ENTER = 0  # 加入游戏消息体长度为0字节
 
 MSG_TYPE_MOVE = 2  # 小球移动消息
-MSG_SIZE_MOVE = 1  # 小球移动消息体长度为1字节，1字节移动方向
+MSG_SIZE_MOVE = 3  # 小球移动消息体长度为3字节,2字节玩家ID,1字节移动方向
 
 # 接受的服务端消息相关常量
 SERVER_MSG_TYPE_POS = 1  # 位置同步消息
@@ -155,7 +159,7 @@ clock = pygame.time.Clock()
 
 # 自己小球
 ball = Ball(WIDTH // 2, HEIGHT // 2, 20, (255, 0, 0), 5)
-self_player_id = None
+self_player_id = 0
 
 last_msg_update_time = time.time()  # 上次统计消息数的时间
 info_font = pygame.font.Font(None, 36)  # 预创建字体，优化性能
@@ -164,7 +168,7 @@ info_font = pygame.font.Font(None, 36)  # 预创建字体，优化性能
 cilent_socket = None
 connected = False
 # =========================网络连接处理=========================
-
+self_player_id = int(input("请输入玩家ID(1-65535)："))
 try:
     cilent_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     cilent_socket.connect(("127.0.0.1", 16543))
@@ -240,7 +244,7 @@ def handle_server_message(msg_type, body_data):
         # - X轴坐标 uint16 2字节
         # - Y轴坐标 uint16 2字节
         # 消息体长:7字节
-        global self_player_id, ball
+        global self_player_id, ball, self_tcp_conn_id
         # 截取2字节ID数据
         player_id = struct.unpack("<H", body_data[:2])[0]
         # 看是否是自身,是就记录
@@ -254,6 +258,7 @@ def handle_server_message(msg_type, body_data):
             ball.x = x
             ball.y = y
         # 否则的情况我们先不做，等后续再处理
+        pass
 
 
 if connected:
@@ -261,129 +266,148 @@ if connected:
 
 
 # =========================主循环=========================
-while True:
-    # 如果没有自己的ID，发送进入的消息，然后等待服务器分配
-    if self_player_id is None:
+
+def main_loop():
+    # 如果成功建立连接，先发送进入的认证消息:
+    # 新客户端(self_player_id is None)发送 0x01 0x0000
+    # 旧客户端()发送 0x02 + 小球ID(uint16)
+    #
+    if connected:
+        if not self_player_id:
+            cilent_socket.sendall(struct.pack(
+                "<BH", AUTH_NEW_CLIENT, self_player_id))
+        else:
+            cilent_socket.sendall(struct.pack(
+                "<BH", AUTH_OLD_CLIENT, self_player_id))
+
+        # 发送进入的消息，然后等待服务器分配
         cilent_socket.sendall(struct.pack(
             "<BH", MSG_TYPE_ENTER, MSG_SIZE_ENTER))
         time.sleep(1)
-    if self_player_id is None:
-        exit(1)
 
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            pygame.quit()
-            sys.exit()
-        elif event.type == pygame.KEYDOWN:  # 空格清空轨迹
-            if event.key == pygame.K_SPACE:
-                ball.trail.clear()
+    while True:
+        if self_player_id is None:
+            exit(1)
 
-    ball.trail.record_per_frame()
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit()
+            elif event.type == pygame.KEYDOWN:  # 空格清空轨迹
+                if event.key == pygame.K_SPACE:
+                    ball.trail.clear()
 
-    keys = pygame.key.get_pressed()
+        ball.trail.record_per_frame()
 
-    ball.cur_speed = ball.init_speed * \
-        1.5 if (keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]
-                ) else ball.init_speed
+        keys = pygame.key.get_pressed()
 
-    is_accel = True if (keys[pygame.K_LSHIFT]
-                        or keys[pygame.K_RSHIFT]) else False
-    move_direction = 0
-    if keys[pygame.K_LEFT]:
-        move_direction = 3
-        ball.x = max(ball.x - ball.cur_speed, ball.r)
-    elif keys[pygame.K_RIGHT]:
-        move_direction = 4
-        ball.x = min(ball.x + ball.cur_speed, WIDTH - ball.r)
-    if keys[pygame.K_UP]:
-        move_direction += 2 if move_direction else 1
-        ball.y = max(ball.y - ball.cur_speed, ball.r)
-    elif keys[pygame.K_DOWN]:
-        move_direction += 4 if move_direction else 2
-        ball.y = min(ball.y + ball.cur_speed, HEIGHT - ball.r)
-    if is_accel and move_direction:
-        move_direction += 10
+        ball.cur_speed = ball.init_speed * \
+            1.5 if (keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]
+                    ) else ball.init_speed
 
-    screen.fill((0, 0, 0))
+        is_accel = True if (keys[pygame.K_LSHIFT]
+                            or keys[pygame.K_RSHIFT]) else False
+        move_direction = 0
+        if keys[pygame.K_LEFT]:
+            move_direction = 3
+            ball.x = max(ball.x - ball.cur_speed, ball.r)
+        elif keys[pygame.K_RIGHT]:
+            move_direction = 4
+            ball.x = min(ball.x + ball.cur_speed, WIDTH - ball.r)
+        if keys[pygame.K_UP]:
+            move_direction += 2 if move_direction else 1
+            ball.y = max(ball.y - ball.cur_speed, ball.r)
+        elif keys[pygame.K_DOWN]:
+            move_direction += 4 if move_direction else 2
+            ball.y = min(ball.y + ball.cur_speed, HEIGHT - ball.r)
+        if is_accel and move_direction:
+            move_direction += 10
 
-    # ===================== 统计 =====================
-    current_time = time.time()
-    # 每1秒更新一次接收消息数
-    if current_time - last_msg_update_time >= 1.0:
-        with recv_msg_count_lock:
-            display_msg_count = recv_msg_count
-            display_byte_count = recv_msg_byte_count
-            recv_msg_count = 0
-            recv_msg_byte_count = 0
-        last_msg_update_time = current_time
-    # 获取实时FPS
-    current_fps = clock.get_fps()
-    # ================================================================
+        screen.fill((0, 0, 0))
 
-    # 显示模式提示
-    mode_text = "Single-Player Mode" if not connected else "Multiplayer Mode"
-    mode_surface = info_font.render(mode_text, True, (100, 100, 100))
-    screen.blit(mode_surface, (WIDTH - 600, 10))
+        # ===================== 统计 =====================
+        current_time = time.time()
+        # 每1秒更新一次接收消息数
+        global display_msg_count, display_byte_count, last_msg_update_time, recv_msg_count, recv_msg_byte_count
+        if current_time - last_msg_update_time >= 1.0:
+            with recv_msg_count_lock:
+                display_msg_count = recv_msg_count
+                display_byte_count = recv_msg_byte_count
+                recv_msg_count = 0
+                recv_msg_byte_count = 0
+            last_msg_update_time = current_time
+        # 获取实时FPS
+        current_fps = clock.get_fps()
+        # ================================================================
 
-    # 多人模式：显示其他玩家
-    if connected:
-        with player_mutex:
-            players_list = list(all_players.items())
+        # 显示模式提示
+        mode_text = "Single-Player Mode" if not connected else "Multiplayer Mode"
+        mode_surface = info_font.render(mode_text, True, (100, 100, 100))
+        screen.blit(mode_surface, (WIDTH - 600, 10))
 
-        for idx, (pl_id, pos) in enumerate(players_list):
-            if pl_id == self_player_id:
-                color = (255, 255, 0)
-            else:
-                color = (0, 255, 0)
-            pygame.draw.circle(screen, color, (pos["X"], pos["Y"]), 20)
-            player_id_surface = info_font.render(
-                str(pl_id), True, (64, 188, 75))
-            screen.blit(player_id_surface, (pos["X"] - 10, pos["Y"] - 10))
+        # 多人模式：显示其他玩家
+        if connected:
+            with player_mutex:
+                players_list = list(all_players.items())
 
-    # 玩家自身的半透明显示
-    # 创建带透明通道的临时表面
-    circle_surf = pygame.Surface((ball.r*2, ball.r*2), pygame.SRCALPHA)
-    # 绘制半透明圆，最后一个参数是透明度
-    pygame.draw.circle(circle_surf, (*ball.color, 80),
-                       (ball.r, ball.r), ball.r)
-    # 将半透明圆贴到屏幕上
-    screen.blit(circle_surf, (ball.x - ball.r, ball.y - ball.r))
+            for _, (pl_id, pos) in enumerate(players_list):
+                if pl_id == self_player_id:
+                    color = (255, 255, 0)
+                else:
+                    color = (0, 255, 0)
+                pygame.draw.circle(screen, color, (pos["X"], pos["Y"]), 20)
+                player_id_surface = info_font.render(
+                    str(pl_id), True, (64, 188, 75))
+                screen.blit(player_id_surface, (pos["X"] - 10, pos["Y"] - 10))
 
-    ball.trail.draw_gradient(screen)
+        # 玩家自身的半透明显示
+        # 创建带透明通道的临时表面
+        circle_surf = pygame.Surface((ball.r*2, ball.r*2), pygame.SRCALPHA)
+        # 绘制半透明圆，最后一个参数是透明度
+        pygame.draw.circle(circle_surf, (*ball.color, 80),
+                           (ball.r, ball.r), ball.r)
+        # 将半透明圆贴到屏幕上
+        screen.blit(circle_surf, (ball.x - ball.r, ball.y - ball.r))
 
-    # 坐标文本
-    pos_text = f"X: {ball.x:.2f}, Y: {ball.y:.2f}"
-    text = info_font.render(pos_text, True, (255, 255, 255))
-    screen.blit(text, (10, 10))
+        ball.trail.draw_gradient(screen)
 
-    # 显示当前玩家数量
-    if connected:
-        with player_mutex:
-            player_count = len(all_players)
-            cur_max_player_id = max(all_players.keys())
-        player_count_text = f"Players:{player_count} - Max ID:{cur_max_player_id}"
-        player_count_surface = info_font.render(
-            player_count_text, True, (255, 255, 255))
-        screen.blit(player_count_surface, (10, 50))
+        # 坐标文本
+        pos_text = f"X: {ball.x:.2f}, Y: {ball.y:.2f}"
+        text = info_font.render(pos_text, True, (255, 255, 255))
+        screen.blit(text, (10, 10))
 
-    # 渲染FPS（青色）
-    fps_surface = info_font.render(
-        f"FPS: {current_fps:.1f}", True, (0, 255, 255))
-    screen.blit(fps_surface, (10, 90))
-    # 渲染每秒接收消息数（绿色）
-    msg_surface = info_font.render(
-        f"Recv Msg/s: {display_msg_count}", True, (0, 255, 0))
-    screen.blit(msg_surface, (10, 130))
-    # 渲染每秒接收字节数（黄色）
-    byte_surface = info_font.render(
-        f"Recv Byte/s: {display_byte_count} (~{display_byte_count/60:.2f}B/pkg)", True, (255, 255, 0))
-    screen.blit(byte_surface, (10, 170))
+        # 显示当前玩家数量
+        if connected:
+            with player_mutex:
+                global cur_max_player_id
+                player_count = len(all_players)
+                cur_max_player_id = max(all_players.keys())
+            player_count_text = f"Players:{player_count} - Max ID:{cur_max_player_id}"
+            player_count_surface = info_font.render(
+                player_count_text, True, (255, 255, 255))
+            screen.blit(player_count_surface, (10, 50))
 
-    # 发送位置（仅在连接时）
-    if connected and move_direction:
-        bin_data = struct.pack("<BHB", MSG_TYPE_MOVE,
-                               MSG_SIZE_MOVE, move_direction)
-        cilent_socket.send(bin_data)
+        # 渲染FPS（青色）
+        fps_surface = info_font.render(
+            f"FPS: {current_fps:.1f}", True, (0, 255, 255))
+        screen.blit(fps_surface, (10, 90))
+        # 渲染每秒接收消息数（绿色）
+        msg_surface = info_font.render(
+            f"Recv Msg/s: {display_msg_count}", True, (0, 255, 0))
+        screen.blit(msg_surface, (10, 130))
+        # 渲染每秒接收字节数（黄色）
+        byte_surface = info_font.render(
+            f"Recv Byte/s: {display_byte_count} (~{display_byte_count/60:.2f}B/pkg)", True, (255, 255, 0))
+        screen.blit(byte_surface, (10, 170))
 
-    pygame.display.flip()
-    clock.tick(64)
+        # 发送位置（仅在连接时）
+        if connected and move_direction:
+            bin_data = struct.pack("<BHHB", MSG_TYPE_MOVE,
+                                   MSG_SIZE_MOVE, self_player_id, move_direction)
+            cilent_socket.send(bin_data)
+
+        pygame.display.flip()
+        clock.tick(64)
+
+
+main_loop()

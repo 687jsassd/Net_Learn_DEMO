@@ -1,9 +1,7 @@
 package model
 
-import "net"
-
 type InGameMsg struct {
-	Conn    net.Conn
+	BallID  uint16
 	MsgType uint8
 	MsgData []byte
 }
